@@ -1,0 +1,50 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -720,6 +721,17 @@ class GPUModelRunner(
+         self.use_async_spec_decode = (
+             self.use_async_scheduling and self.num_spec_tokens > 0
+         )
++        # HYBRID_SUFFIX=1: suffix-decoding drafts override MTP rows (K fixed).
++        # Off (default) never builds the object, so every hook below is skipped.
++        self._hybrid_suffix = None
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.method == "mtp"
++            and os.environ.get("HYBRID_SUFFIX", "0") == "1"
++        ):
++            from vllm.v1.spec_decode.hybrid_suffix import HybridSuffix
++
++            self._hybrid_suffix = HybridSuffix(self)
+ 
+         # Request states.
+         self.requests: dict[str, CachedRequestState] = {}
+@@ -4706,6 +4718,11 @@ class GPUModelRunner(
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+         )
++        if self._hybrid_suffix is not None:
++            # D2H of the sampled tokens, ordered before the drafter's kernels.
++            self._hybrid_suffix.on_sampled(
++                sampler_output.sampled_token_ids, spec_decode_metadata
++            )
+         if self.use_async_scheduling:
+             pp = get_pp_group()
+             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
+@@ -5394,6 +5411,8 @@ class GPUModelRunner(
+                 if draft_probs is not None:
+                     self._draft_probs = draft_probs
+                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
++            if self._hybrid_suffix is not None:
++                draft_token_ids = self._hybrid_suffix.merge(draft_token_ids)
+ 
+         return draft_token_ids
+ 

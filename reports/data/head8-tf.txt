@@ -1,0 +1,36 @@
+# teacher forcing 逐条：<tag> <lang> <i> <一致> / <总数>
+A-self en 0 898 / 900
+A-self en 1 900 / 900
+A-self en 2 608 / 614
+A-self en 3 896 / 900
+A-self en 4 896 / 900
+A-self en 5 896 / 900
+A-self en 6 892 / 900
+A-self en 7 899 / 900
+A-self zh 0 596 / 600
+A-self zh 1 897 / 900
+A-self zh 2 888 / 900
+A-self zh 3 897 / 900
+A-self zh 4 593 / 599
+A-self zh 5 895 / 900
+A-self zh 6 893 / 900
+A-self zh 7 894 / 900
+D2-on-A en 0 894 / 900
+D2-on-A en 1 886 / 900
+D2-on-A en 2 587 / 614
+D2-on-A en 3 891 / 900
+D2-on-A en 4 882 / 900
+D2-on-A en 5 886 / 900
+D2-on-A en 6 882 / 900
+D2-on-A en 7 892 / 900
+D2-on-A zh 0 583 / 600
+D2-on-A zh 1 874 / 900
+D2-on-A zh 2 869 / 900
+D2-on-A zh 3 875 / 900
+D2-on-A zh 4 568 / 599
+D2-on-A zh 5 870 / 900
+D2-on-A zh 6 873 / 900
+D2-on-A zh 7 881 / 900
+
+# A-self 合计 13438/13513 = 99.4450%
+# D2-on-A 合计 13193/13513 = 97.6319%

@@ -1,0 +1,60 @@
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -106,6 +106,22 @@
+             )
+             logger.info("MTP drafter uses a %d-token draft head", int(_ids.numel()))
+ 
++        # head8 patch: separate full-vocab int4 draft head (mtp.draft_head4.*,
++        # matched by the ^mtp\. int4 group) so drafting reads the int4 lm_head
++        # while the target model verifies with its own (int8) lm_head.
++        # The name must neither end in "lm_head" (first-match would pick the
++        # lm_head quant group) nor contain "draft_lm_head" (skipped on load).
++        self.draft_head4 = None
++        if _os.environ.get("MTP_DRAFT_HEAD4", "0") == "1":
++            self.draft_head4 = ParallelLMHead(
++                self.vocab_size,
++                config.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "draft_head4"),
++            )
++            logger.info("head8: MTP drafter uses separate draft_head4 (%s)",
++                        type(self.draft_head4.quant_method).__name__)
++
+         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
+         # missing from hf_quant_config.json exclude_modules. Force unquantized.
+         # Ref: https://github.com/vllm-project/vllm/pull/38650
+@@ -323,6 +339,9 @@
+         hidden_states: torch.Tensor,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor | None:
++        # head8 patch: int4 draft head for drafting, target lm_head untouched
++        if self.model.draft_head4 is not None:
++            return self.logits_processor(self.model.draft_head4, hidden_states)
+         # syv patch: vocab-truncated draft head
+         if self.draft_logits_processor is not None:
+             sub = self.draft_logits_processor(self.model.draft_lm_head, hidden_states)
+@@ -343,6 +362,8 @@
+                 # syv patch: skip the truncated draft head when it is disabled
+                 if "draft_lm_head" in name and self.model.draft_lm_head is None:
+                     continue
++                if "draft_head4" in name and self.model.draft_head4 is None:
++                    continue
+                 if name.startswith("mtp."):
+                     name = name.replace("mtp.", "model.")
+                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
+@@ -353,7 +374,14 @@
+                 yield name, weight
+ 
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(remap_weight_names(weights))
++        loaded = loader.load_weights(remap_weight_names(weights))
++        if self.model.draft_head4 is not None:
++            logger.info(
++                "head8: draft_head4 %s | own lm_head %s",
++                {k: tuple(v.shape) for k, v in self.model.draft_head4.named_parameters()},
++                {k: tuple(v.shape) for k, v in self.lm_head.named_parameters()},
++            )
++        return loaded
+ 
+ 
+ class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

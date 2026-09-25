@@ -1,0 +1,9 @@
+# litellm（实测 1.97.0）会话粘滞：并入现有 config.yaml 的 router_settings，其余不变
+router_settings:
+  routing_strategy: simple-shuffle          # 不带会话 id 的请求仍随机分发
+  optional_pre_call_checks: ["session_affinity"]
+  deployment_affinity_ttl_seconds: 3600
+# 会话 id 来源（实测）：x-litellm-session-id；或 x-<客户端>-session-id（如 Claude Code 自带的
+# x-claude-code-session-id，值需类似 UUID、至少 8 位）。OpenAI 与 Anthropic 两种接口都生效；
+# Anthropic 请求的 metadata.user_id 也会被当作会话 id（实测 8/8 落到同一副本）。
+# 不要用 deployment_affinity：它按 API key 粘滞，共享 key 的流量会全部压到一个副本。

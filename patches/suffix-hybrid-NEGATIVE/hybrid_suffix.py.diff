@@ -1,0 +1,407 @@
+--- /dev/null
++++ b/vllm/v1/spec_decode/hybrid_suffix.py
+@@ -0,0 +1,404 @@
++# SPDX-License-Identifier: Apache-2.0
++"""MTP + suffix-decoding hybrid drafting with a fixed draft length K.
++
++MTP drafts every step as usual. For a request whose suffix-tree match clears the
++threshold, the suffix draft replaces the MTP row (TRT-LLM ``use_sa_spec`` /
++Arctic ``index_copy_`` style). K, the CUDA graphs, the GDN/Mamba spec-state
++buffers and the rejection sampler are untouched: the target model verifies
++every row, so greedy output matches plain MTP up to numerics.
++
++Enabled by ``HYBRID_SUFFIX=1`` (otherwise the runner never builds this object):
++
++  HYBRID_SUFFIX_TAU      4 (fixed, default) | ema | never (pipeline on, no override)
++  HYBRID_SUFFIX_GATE     fixed tau compares: match (suffix match length, TRT
++                         semantics, default) | score (expected accepted drafts)
++  HYBRID_SUFFIX_MAX_BS   override only while the batch has <= this many requests (4)
++  HYBRID_SUFFIX_DEPTH    suffix tree depth (32)
++  HYBRID_SUFFIX_CACHE    global cache of past responses, #requests (1000; 0 = off)
++  HYBRID_SUFFIX_MIN_PROB min cumulative token prob in a draft (0.1)
++  HYBRID_SUFFIX_ALPHA    EMA weight of the newest MTP row (0.3)
++  HYBRID_SUFFIX_LOG_S    period of the aggregate log line, seconds (10)
++  HYBRID_SUFFIX_REQLOG   one log line per finished request (1)
++  HYBRID_SUFFIX_DEBUG    check the one-hot draft probs of overridden rows (0)
++
++Async scheduling: the sampled tokens are copied D2H on a dedicated stream that
++waits for sampling only, so the MTP drafter kernels enqueued afterwards overlap
++with the CPU-side suffix work. The copy is issued every step; the CPU waits on
++it only in steps that may override (batch <= MAX_BS). Other steps drain
++finished copies without blocking, which keeps each request's history complete.
++"""
++
++from __future__ import annotations
++
++import os
++import time
++from collections import deque
++from dataclasses import dataclass, field
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_RING = 8
++
++
++def _env(name: str, default: str) -> str:
++    return os.environ.get(name, default)
++
++
++@dataclass
++class HybridConfig:
++    k: int
++    tau: str = field(default_factory=lambda: _env("HYBRID_SUFFIX_TAU", "4"))
++    gate: str = field(default_factory=lambda: _env("HYBRID_SUFFIX_GATE", "match"))
++    max_bs: int = field(default_factory=lambda: int(_env("HYBRID_SUFFIX_MAX_BS", "4")))
++    depth: int = field(default_factory=lambda: int(_env("HYBRID_SUFFIX_DEPTH", "32")))
++    cache_reqs: int = field(
++        default_factory=lambda: int(_env("HYBRID_SUFFIX_CACHE", "1000"))
++    )
++    min_prob: float = field(
++        default_factory=lambda: float(_env("HYBRID_SUFFIX_MIN_PROB", "0.1"))
++    )
++    spec_factor: float = 1.0
++    alpha: float = field(default_factory=lambda: float(_env("HYBRID_SUFFIX_ALPHA", "0.3")))
++    log_s: float = field(default_factory=lambda: float(_env("HYBRID_SUFFIX_LOG_S", "10")))
++    reqlog: bool = field(default_factory=lambda: _env("HYBRID_SUFFIX_REQLOG", "1") == "1")
++    debug: bool = field(default_factory=lambda: _env("HYBRID_SUFFIX_DEBUG", "0") == "1")
++
++    def __post_init__(self):
++        if self.tau not in ("ema", "never"):
++            float(self.tau)  # fail fast on a typo
++        assert self.gate in ("match", "score"), self.gate
++
++
++class _ReqStat:
++    __slots__ = ("prompt", "out", "m_rows", "m_acc", "s_rows", "s_acc", "ema")
++
++    def __init__(self, prompt: int, ema: float):
++        self.prompt = prompt
++        self.out = 0
++        self.m_rows = self.m_acc = self.s_rows = self.s_acc = 0
++        self.ema = ema
++
++
++class SuffixCore:
++    """CPU side: suffix trees, per-request history, gating and statistics.
++
++    Newest-step tokens are added to the tree one step late. Speculating with a
++    context that ends in tokens already in the tree would always find the
++    context itself at the tree tail, a match with no continuation, which halves
++    the probability of every single-copy continuation.
++    """
++
++    def __init__(self, cfg: HybridConfig):
++        from arctic_inference.suffix_decoding import SuffixDecodingCache
++
++        self.cfg = cfg
++        self.cache = SuffixDecodingCache(
++            max_tree_depth=cfg.depth, max_cached_requests=cfg.cache_reqs
++        )
++        self.tail: dict[str, list[int]] = {}  # last `depth` tokens, prompt+output
++        self.unadded: dict[str, list[int]] = {}  # newest step, not in the tree yet
++        self.ntok: dict[str, int] = {}
++        self.req: dict[str, _ReqStat] = {}
++        self.global_ema = float(cfg.k) * 0.75
++        # aggregate counters
++        self.hist = {"M": [0] * (cfg.k + 1), "S": [0] * (cfg.k + 1)}
++        self.n_override = 0
++        self.n_candidates = 0
++        self.build_ms = 0.0
++
++    # -- history ---------------------------------------------------------
++    def ingest(self, rid: str, toks: list[int], prompt: np.ndarray | None) -> None:
++        if rid not in self.tail:
++            if prompt is None:
++                return  # first sight without a prompt (should not happen)
++            t0 = time.perf_counter()
++            if rid in self.cache.cached_requests:
++                self.cache.evict_cached_response(rid)
++            p = np.ascontiguousarray(prompt, dtype=np.int32)
++            self.cache.start_request(rid, p)
++            self.build_ms += (time.perf_counter() - t0) * 1e3
++            self.tail[rid] = p[-self.cfg.depth:].tolist()
++            self.unadded[rid] = []
++            self.ntok[rid] = len(p)
++            self.req[rid] = _ReqStat(len(p), self.global_ema)
++        if self.unadded[rid]:
++            self.cache.add_active_response(rid, self.unadded[rid])
++        self.unadded[rid] = toks
++        tail = self.tail[rid]
++        tail.extend(toks)
++        if len(tail) > self.cfg.depth:
++            del tail[: len(tail) - self.cfg.depth]
++        self.ntok[rid] += len(toks)
++        self.req[rid].out += len(toks)
++
++    def stop(self, rid: str) -> None:
++        if rid not in self.tail:
++            return
++        if self.unadded[rid]:
++            self.cache.add_active_response(rid, self.unadded[rid])
++        self.cache.stop_request(rid)
++        st = self.req.pop(rid)
++        for d in (self.tail, self.unadded, self.ntok):
++            d.pop(rid, None)
++        if self.cfg.reqlog:
++            logger.info(
++                "[hybrid-suffix] REQ %s prompt=%d out=%d M=%d/%d S=%d/%d",
++                rid, st.prompt, st.out, st.m_acc, st.m_rows, st.s_acc, st.s_rows,
++            )
++
++    def tracked(self):
++        return self.tail.keys()
++
++    # -- acceptance feedback --------------------------------------------
++    def observe(self, rid: str, kind: str, accepted: int) -> None:
++        st = self.req.get(rid)
++        a = max(0, min(accepted, self.cfg.k))
++        self.hist[kind][a] += 1
++        if st is None:
++            return
++        if kind == "S":
++            st.s_rows += 1
++            st.s_acc += a
++        else:
++            st.m_rows += 1
++            st.m_acc += a
++            al = self.cfg.alpha
++            st.ema = (1 - al) * st.ema + al * a
++            self.global_ema = 0.98 * self.global_ema + 0.02 * a
++
++    # -- proposal ----------------------------------------------------------
++    def propose(self, rid: str, max_model_len: int) -> list[int] | None:
++        """Suffix draft for `rid` if it clears the threshold, else None."""
++        cfg = self.cfg
++        if rid not in self.tail:
++            return None
++        k = min(cfg.k, max_model_len - self.ntok[rid] - 1)
++        if k <= 0:
++            return None
++        self.n_candidates += 1
++        d = self.cache.speculate(
++            rid,
++            self.tail[rid],
++            max_spec_tokens=k,
++            max_spec_factor=cfg.spec_factor,
++            min_token_prob=cfg.min_prob,
++        )
++        if not d.token_ids:
++            return None
++        if cfg.tau == "never":
++            return None
++        if cfg.tau == "ema":
++            ok = d.score > self.req[rid].ema
++        else:
++            tau = float(cfg.tau)
++            if cfg.gate == "match":
++                # TRT-LLM sa_spec_threshold: match length, full-length draft only.
++                ok = d.match_len >= tau and len(d.token_ids) >= k
++            else:
++                ok = d.score >= tau
++        if not ok:
++            return None
++        self.n_override += 1
++        return list(d.token_ids)
++
++
++@dataclass
++class _Entry:
++    slot: int
++    event: torch.Event
++    src: torch.Tensor  # keeps the D2H source alive until the copy is done
++    n: int
++    c: int
++    req_ids: list[str]
++    discard: np.ndarray
++    prompts: dict[str, np.ndarray]
++    num_draft: list[int] | None
++    kinds: dict[str, str]
++
++
++class HybridSuffix:
++    def __init__(self, runner):
++        self.r = runner
++        self.cfg = HybridConfig(k=runner.num_spec_tokens)
++        self.core = SuffixCore(self.cfg)
++        self.stream = torch.cuda.Stream()
++        self.pending: deque[_Entry] = deque()
++        self.free_slots = list(range(_RING))
++        self.pinned: torch.Tensor | None = None
++        self.ov_pin: torch.Tensor | None = None
++        self.idx_pin: torch.Tensor | None = None
++        self.kinds: dict[str, str] = {}  # kind of the draft proposed last step
++        self.last_rows: dict[str, bool] = {}  # rows with valid tokens in the newest entry
++        self.last_req_ids: list[str] = []
++        # counters
++        self.steps_active = self.steps_inactive = 0
++        self.wait_ms = self.cpu_ms = 0.0
++        self.t_log = time.monotonic()
++        logger.info("[hybrid-suffix] enabled: %s", self.cfg)
++
++    # -- step N, right after sampling, before the drafter is enqueued -------
++    def on_sampled(self, sampled: torch.Tensor, spec_decode_metadata) -> None:
++        r = self.r
++        n, c = sampled.shape[0], sampled.shape[1]
++        if self.pinned is None or self.pinned.shape[2] < c or self.pinned.dtype != sampled.dtype:
++            self._drain(block=True)
++            self.pinned = torch.empty(
++                (_RING, r.max_num_reqs, max(c, self.cfg.k + 1)),
++                dtype=sampled.dtype, device="cpu", pin_memory=True,
++            )
++        if not self.free_slots:
++            self._process(self.pending.popleft(), block=True)
++        slot = self.free_slots.pop()
++        ev = torch.Event()
++        default = torch.cuda.current_stream()
++        with torch.cuda.stream(self.stream):
++            self.stream.wait_stream(default)
++            self.pinned[slot, :n, :c].copy_(sampled, non_blocking=True)
++            ev.record()
++
++        req_ids = list(r.input_batch.req_ids[:n])
++        discard = np.nonzero(r.discard_request_mask.np[:n])[0]
++        dset = set(discard.tolist())
++        prompts: dict[str, np.ndarray] = {}
++        known = self.core.tracked()
++        pending_new = {p for e in self.pending for p in e.prompts}
++        for i, rid in enumerate(req_ids):
++            if i in dset or rid in known or rid in pending_new:
++                continue
++            np_ = int(r.input_batch.num_prompt_tokens[i])
++            prompts[rid] = r.input_batch.token_ids_cpu[i, :np_].copy()
++        num_draft = (
++            list(spec_decode_metadata.num_draft_tokens)
++            if spec_decode_metadata is not None else None
++        )
++        self.pending.append(_Entry(slot, ev, sampled, n, c, req_ids, discard,
++                                   prompts, num_draft, self.kinds))
++        self.kinds = {}
++
++    # -- step N, after MTP proposed ----------------------------------------
++    def merge(self, draft: torch.Tensor) -> torch.Tensor:
++        r = self.r
++        n = draft.shape[0]
++        if n > self.cfg.max_bs or not self.pending:
++            self.steps_inactive += 1
++            self._drain(block=False)
++            self._maybe_log()
++            return draft
++        self.steps_active += 1
++        t0 = time.perf_counter()
++        self.pending[-1].event.synchronize()
++        t1 = time.perf_counter()
++        self._drain(block=True)
++        req_ids = self.last_req_ids
++        rows: list[int] = []
++        toks: list[list[int]] = []
++        if len(req_ids) == n:
++            for i, rid in enumerate(req_ids):
++                if not self.last_rows.get(rid):
++                    continue
++                d = self.core.propose(rid, r.max_model_len)
++                if d is None:
++                    self.kinds[rid] = "M"
++                    continue
++                self.kinds[rid] = "S"
++                rows.append(i)
++                toks.append(d)
++        if rows:
++            self._overlay(draft, rows, toks)
++        t2 = time.perf_counter()
++        self.wait_ms += (t1 - t0) * 1e3
++        self.cpu_ms += (t2 - t1) * 1e3
++        self._maybe_log()
++        return draft
++
++    def _overlay(self, draft: torch.Tensor, rows: list[int], toks: list[list[int]]):
++        r = self.r
++        k = draft.shape[1]
++        if self.ov_pin is None or self.ov_pin.dtype != draft.dtype:
++            self.ov_pin = torch.zeros((r.max_num_reqs, k), dtype=draft.dtype, pin_memory=True)
++            self.idx_pin = torch.zeros(r.max_num_reqs, dtype=torch.int64, pin_memory=True)
++        m = len(rows)
++        ov = self.ov_pin[:m]
++        ov_np = ov.numpy()
++        ov_np[:] = 0  # short drafts are padded with token 0 (verified, rejected)
++        for j, t in enumerate(toks):
++            ov_np[j, : len(t)] = t[:k]
++        idx = self.idx_pin[:m]
++        idx.numpy()[:] = rows
++        ov_g = ov.to(draft.device, non_blocking=True)
++        idx_g = idx.to(draft.device, non_blocking=True)
++        draft.index_copy_(0, idx_g, ov_g)
++        probs = r._draft_probs
++        if probs is not None:
++            # q = one-hot for suffix rows: accept w.p. p(x), recover from p
++            # without x -- the same rule the sampler applies with no draft probs.
++            sub = torch.zeros((m, k, probs.shape[-1]), dtype=probs.dtype, device=probs.device)
++            sub.scatter_(2, ov_g.long().unsqueeze(-1), 1.0)
++            probs.index_copy_(0, idx_g, sub)
++            if self.cfg.debug:
++                assert r._draft_prob_req_ids == list(r.input_batch.req_ids)
++                got = probs[idx_g].gather(2, ov_g.long().unsqueeze(-1))
++                assert bool((got == 1).all()), "one-hot draft probs not in place"
++
++    # -- bookkeeping -----------------------------------------------------------
++    def _drain(self, block: bool) -> None:
++        while self.pending:
++            e = self.pending[0]
++            if not block and not e.event.query():
++                break
++            self.pending.popleft()
++            self._process(e, block=True)
++        self._stop_finished()
++
++    def _process(self, e: _Entry, block: bool) -> None:
++        e.event.synchronize()
++        arr = self.pinned[e.slot, : e.n, : e.c].numpy()
++        vocab = self.r.input_batch.vocab_size
++        valid = (arr >= 0) & (arr < vocab)
++        dset = set(e.discard.tolist())
++        rows: dict[str, bool] = {}
++        for i, rid in enumerate(e.req_ids):
++            if i in dset:
++                continue
++            t = arr[i][valid[i]].tolist()
++            if not t:
++                continue
++            if e.num_draft is not None and i < len(e.num_draft) and e.num_draft[i] > 0:
++                self.core.observe(rid, e.kinds.get(rid, "M"), len(t) - 1)
++            self.core.ingest(rid, t, e.prompts.get(rid))
++            rows[rid] = True
++        self.last_rows = rows
++        self.last_req_ids = e.req_ids
++        e.src = None
++        self.free_slots.append(e.slot)
++
++    def _stop_finished(self) -> None:
++        live = self.r.requests.keys()
++        busy = {rid for e in self.pending for rid in e.req_ids}
++        for rid in [x for x in self.core.tracked() if x not in live and x not in busy]:
++            self.core.stop(rid)
++
++    def _maybe_log(self) -> None:
++        now = time.monotonic()
++        if now - self.t_log < self.cfg.log_s:
++            return
++        self.t_log = now
++        c = self.core
++        hm, hs = c.hist["M"], c.hist["S"]
++        nm, ns = sum(hm), sum(hs)
++        am = sum(i * v for i, v in enumerate(hm)) / nm if nm else 0.0
++        as_ = sum(i * v for i, v in enumerate(hs)) / ns if ns else 0.0
++        act = max(1, self.steps_active)
++        logger.info(
++            "[hybrid-suffix] steps act=%d inact=%d | rows M=%d acc=%.3f S=%d acc=%.3f "
++            "cover=%.1f%% | cand=%d ovr=%d | wait=%.2fms cpu=%.2fms /act-step "
++            "build=%.0fms | histM=%s histS=%s",
++            self.steps_active, self.steps_inactive, nm, am, ns, as_,
++            100.0 * ns / max(1, nm + ns), c.n_candidates, c.n_override,
++            self.wait_ms / act, self.cpu_ms / act, c.build_ms, hm, hs,
++        )

@@ -1,0 +1,15 @@
+This repository contains patches (patches/**/*.diff) against the following
+Apache-2.0 licensed projects. Those patches are licensed under the Apache
+License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+- vLLM — https://github.com/vllm-project/vllm (Apache-2.0)
+  Copyright contributors to the vLLM project.
+- HyperQwen — https://github.com/syv-ai/HyperQwen (Apache-2.0)
+  The vLLM files patched here already carry HyperQwen's patch series
+  ("syv patch" markers); our diffs apply on top of that series.
+- ArcticInference — https://github.com/snowflakedb/ArcticInference (Apache-2.0)
+  patches/suffix-hybrid-NEGATIVE uses its suffix_decoding extension at runtime;
+  no ArcticInference source is copied into this repository.
+
+Everything else (bench/, deploy/, charts/, reports/, scripts) is MIT licensed,
+see LICENSE.

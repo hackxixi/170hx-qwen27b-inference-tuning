@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+workload.json
+transcript.json
+long4k.txt
+long32k.txt

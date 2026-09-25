@@ -1,0 +1,14 @@
+model_list:
+  - model_name: qwen3.8-27b
+    litellm_params: {model: openai/qwen3.8-27b, api_base: "http://replica-1:18020/v1", api_key: os.environ/HQKEY, extra_body: {chat_template_kwargs: {enable_thinking: false}}}
+    model_info: {id: replica-1}
+  - model_name: qwen3.8-27b
+    litellm_params: {model: openai/qwen3.8-27b, api_base: "http://replica-2:18020/v1", api_key: os.environ/HQKEY, extra_body: {chat_template_kwargs: {enable_thinking: false}}}
+    model_info: {id: replica-2}
+general_settings: {master_key: os.environ/LMK}
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 0
+  timeout: 600
+  optional_pre_call_checks: ["session_affinity"]
+  deployment_affinity_ttl_seconds: 3600
