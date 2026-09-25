@@ -1,19 +1,31 @@
+中文 | [English](README.en.md)
+
 # 170hx-qwen27b-inference-tuning
 
 在 NVIDIA CMP 170HX（GA100，sm_80，64GB）上跑 Qwen3.8-27B 的推理优化记录，包括完整的测试方法、补丁、脚本和原始数据。起点是 [HyperQwen](https://github.com/syv-ai/HyperQwen)（vLLM + MTP 投机解码）。这一轮试了 10 个方向：上线 3 项，否决 7 项。
 
-<p align="center"><img src="charts/summary-long.png" width="420" alt="优化总结长图"></p>
+![HyperQwen 上游、170hx-fullstack 原方案与本仓库最终方案的速度与精度对比](charts/hero-zh.png)
+
+## 成绩摘要
+
+- **相对 HyperQwen 上游**（MTP k=4、int4 输出头，同一套负载）：中文单流 +8.1%，32k 长输入 +9.0%；英文单流 +3.0%、8 并发 英 +2.7% / 中 +1.2%、开发场景 8 并发 +2.0% 都在推算的不确定度（约 ±3%，开发场景 ±5%）以内，按持平算。速度账分两部分：组合版本身比 int8 输出头版快 5–9%（测试卡），生产同时段 A/B 快 6–12%；int8 输出头为精度付出 0–4% 的速度（4k 长输入 7%）。
+- **输出头 int4 → int8**：logits 的量化误差从 11–16% 降到 0.65–0.95%，约为原来的 1/17，主体权重不变。与 int4 头版的 top1 一致率 97.63%（同配置自比的噪声底 99.45%），分歧都落在 top1 概率 <0.6 的近平局上。vLLM 0.30 与 int4 起草头这两项投机相关改动，贪心输出与基线等价。
+- **与 170hx-fullstack 原方案比**（本仓库的负载与硬件下）：8 并发 英 +27.8% / 中 +50.2%，中文单流 +34.7%，32k 长输入 +47.1%，开发场景 8 并发 +34.5%；英文单流低 7.5%，对方的 DFlash2 在代码题上更快。
+- **网关会话粘滞**：两副本回放多轮开发会话，后续轮 TTFT 均值降到原来的 1/6.5（9.46 → 1.45 s）和 1/1.8（4.37 → 2.45 s），会话耗时中位 −63% / −40%，不改变输出。
+- **与原始 bf16 模型的距离**：没有直接实测。理论上主体仍是 int4 g128（误差 11–16%），按公开经验 W4 g128 相对 bf16 通常掉 0.5–1.5 分；本方案去掉了上游多出来的 int4 输出头误差，KV 保持 bf16，投机解码不改变输出。
+
+> 口径：HyperQwen 上游与 170hx-fullstack 是 2026-09-24 在同一张卡上实测的（[reports/01](reports/01-three-way-comparison.md)）；开发场景 8 并发是 2026-09-25 的 devbench 回放，每档单遍（[03](reports/03-dev-workload.md)）。本仓库最终方案是推算值：上游实测 ×「int8 输出头 / int4 输出头」（[02](reports/02-int8-lm-head.md)，同卡；开发场景取 [03](reports/03-dev-workload.md)）×「组合版 / 基线」（[04](reports/04-decode-six-items.md)，同卡）。两次测试用的不是同一张卡，所以只用各自的同卡比值；两个比值各带 ±2% 噪声，连乘后不确定度约 ±3%。「HyperQwen 上游」指 684e927 + `-fast` 模型，设了 `SPEC=mtp`、`DRAFT_TOKENS=4`、`MTP_DRAFT_VOCAB=0`：sm80 上的上游默认 `SPEC=dflash2` 会触发 Xid 31，默认的 40k 草稿词表下中文单流只有 68 tok/s（[01](reports/01-three-way-comparison.md) §4、[10](reports/10-dflash2-and-hybrid-research.md) §1）。作为参照，上游 [issue #98](https://github.com/syv-ai/HyperQwen/issues/98) 在同款卡上的社区实测是 MTP k=4 英文代码 177、散文 162 tok/s（8,484 token 提示，负载与本仓库不同）。170hx-fullstack README 自报的单流 218–300 tok/s 在本环境未能复现，测试条件可能不同。精度数字来自 [reports/09](reports/09-precision-theory.md) 的 group=128 数值模拟与 [02](reports/02-int8-lm-head.md) 的实测。
 
 **全部变体的数据总表见 [RESULTS.md](RESULTS.md)**，测试方法见 [reports/00](reports/00-methodology.md)。
 
-## 成果摘要
+## 各方向结果
 
 ### 已上线
 
 | 项 | 效果 | 精度 |
 |---|---|---|
 | **输出头 int4 → int8** | 常规负载慢 0–5%，4k 长输入慢 7% | 与 int4 版的 top1 一致率 97.6%（测法噪声底 99.45%），分歧都落在 top1 概率 <~0.6 的「分岔 token」上 |
-| **组合版：vLLM 0.30 + int4 起草头** | 生产同时段 A/B：单流 英 +12% / 中 +11%，8 并发 英 +8% / 中 +6% | 贪心输出等价（分歧处差值基线侧 ≤0.25 nats） |
+| **组合版：vLLM 0.30 + int4 起草头** | 生产同时段 A/B（对 int8 输出头版）：单流 英 +12% / 中 +11%，8 并发 英 +8% / 中 +6% | 贪心输出等价（分歧处差值基线侧 ≤0.25 nats） |
 | **网关会话粘滞**（litellm session_affinity） | 后续轮 TTFT 9.46→1.45 s / 4.37→2.45 s；会话耗时 100→37 s / 89→53 s | 无影响 |
 
 会话粘滞识别三种会话 id，均已实测生效：`x-litellm-session-id`；`x-*-session-id`（值要像 UUID、至少 8 位，如 Claude Code 自带的 `x-claude-code-session-id`）；Anthropic 请求的 `metadata.user_id`。OpenAI 与 Anthropic 两种接口都已实测生效，详见 [reports/07](reports/07-session-affinity-routing.md)。
@@ -84,11 +96,13 @@
 
 ## 图表
 
+<p align="center"><img src="charts/summary-long.png" width="420" alt="优化总结长图"></p>
+
 | 速度对比 | 精度对比 | 开发场景 |
 |---|---|---|
 | ![](charts/speed-compare-mobile.png) | ![](charts/precision-compare-mobile.png) | ![](charts/dev-compare-mobile.png) |
 
-前三张图做于 2026-09-24 ~ 25，图中的「现役」指当时的 int4 输出头版，不是最终配置。图由 `charts/*.py` 生成（需要 matplotlib 和 Noto Sans CJK 字体）：`python3 charts/chart_summary.py`。
+上面三张对比图做于 2026-09-24 ~ 25，图中的「现役」指当时的 int4 输出头版，不是最终配置。首图（[`charts/hero-zh.png`](charts/hero-zh.png)）由 `charts/chart_hero.py` 生成。所有图都由 `charts/*.py` 生成（需要 matplotlib 和 Noto Sans CJK 字体），例如 `python3 charts/chart_summary.py`。
 
 ## 如何复现
 1. 按 [cmpunlocker](https://github.com/buliaoyin/cmpunlocker) 解锁 64GB 显存（驱动每次升级后都要重打）。

@@ -1,3 +1,5 @@
+中文 | [English](RESULTS.en.md)
+
 # 全部变体总表
 
 每行一个测过的变体。数字都是**相对该行基线**的变化，不同基线之间不能直接比（基线定义见 [reports/00](reports/00-methodology.md) §2）：
